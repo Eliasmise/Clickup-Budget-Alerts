@@ -84,6 +84,19 @@ const extractUserIdsFromUserArray = (value: unknown): string[] => {
   return [...new Set(ids)];
 };
 
+const ASSIGNEE_QUERY_UNASSIGNED = '__UNASSIGNED__';
+const ASSIGNEE_QUERY_NONE = '__NONE__';
+
+const buildAssigneeQueryValues = (assigneeIds?: string[]): string[] => {
+  const normalized = [...new Set((assigneeIds ?? []).map((id) => id.trim()).filter((id) => id.length > 0))];
+  if (normalized.length === 0) {
+    return [ASSIGNEE_QUERY_NONE];
+  }
+
+  // Query named assignees, unassigned tasks, and one unfiltered pass to avoid API edge omissions.
+  return [...normalized, ASSIGNEE_QUERY_UNASSIGNED, ASSIGNEE_QUERY_NONE];
+};
+
 export class ClickUpClient {
   private readonly token: string;
   private readonly baseUrl: string;
@@ -288,12 +301,19 @@ export class ClickUpClient {
   }): Promise<TimeEntry[]> {
     const entries: TimeEntry[] = [];
     const seenIds = new Set<string>();
-    const assigneeIds = params.assigneeIds?.length ? [...new Set(params.assigneeIds)] : [undefined];
+    const assigneeQueryValues = buildAssigneeQueryValues(params.assigneeIds);
 
-    for (const assigneeId of assigneeIds) {
+    for (const assigneeQueryValue of assigneeQueryValues) {
       let page = 0;
       let cursor: string | undefined;
       let guard = 0;
+
+      const assigneeValue =
+        assigneeQueryValue === ASSIGNEE_QUERY_UNASSIGNED
+          ? '0'
+          : assigneeQueryValue === ASSIGNEE_QUERY_NONE
+            ? undefined
+            : assigneeQueryValue;
 
       while (guard < 200) {
         guard += 1;
@@ -303,7 +323,7 @@ export class ClickUpClient {
           end_date: params.endMs,
           folder_id: params.folderId,
           list_id: params.listId,
-          assignee: assigneeId,
+          assignee: assigneeValue,
           include_task_tags: 'true'
         };
 
