@@ -86,16 +86,15 @@ const extractUserIdsFromUserArray = (value: unknown): string[] => {
 
 const ASSIGNEE_QUERY_UNASSIGNED = '__UNASSIGNED__';
 const ASSIGNEE_QUERY_NONE = '__NONE__';
-const ASSIGNEE_QUERY_ALL = '__ALL__';
 
 const buildAssigneeQueryValues = (assigneeIds?: string[]): string[] => {
   const normalized = [...new Set((assigneeIds ?? []).map((id) => id.trim()).filter((id) => id.length > 0))];
   if (normalized.length === 0) {
-    return [ASSIGNEE_QUERY_NONE, ASSIGNEE_QUERY_ALL];
+    return [ASSIGNEE_QUERY_NONE];
   }
 
   // Query named assignees, unassigned tasks, and one unfiltered pass to avoid API edge omissions.
-  return [...normalized, ASSIGNEE_QUERY_UNASSIGNED, ASSIGNEE_QUERY_ALL, ASSIGNEE_QUERY_NONE];
+  return [...normalized, ASSIGNEE_QUERY_UNASSIGNED, ASSIGNEE_QUERY_NONE];
 };
 
 export class ClickUpClient {
@@ -340,87 +339,99 @@ export class ClickUpClient {
       const assigneeValue =
         assigneeQueryValue === ASSIGNEE_QUERY_UNASSIGNED
           ? '0'
-          : assigneeQueryValue === ASSIGNEE_QUERY_ALL
-            ? 'all'
           : assigneeQueryValue === ASSIGNEE_QUERY_NONE
             ? undefined
             : assigneeQueryValue;
 
-      while (guard < 200) {
-        guard += 1;
+      try {
+        while (guard < 200) {
+          guard += 1;
 
-        const query: Record<string, string | number | boolean | undefined> = {
-          start_date: params.startMs,
-          end_date: params.endMs,
-          folder_id: params.folderId,
-          list_id: params.listId,
-          assignee: assigneeValue,
-          include_task_tags: 'true'
-        };
+          const query: Record<string, string | number | boolean | undefined> = {
+            start_date: params.startMs,
+            end_date: params.endMs,
+            folder_id: params.folderId,
+            list_id: params.listId,
+            assignee: assigneeValue,
+            include_task_tags: 'true'
+          };
 
-        if (cursor) {
-          query.cursor = cursor;
-        } else {
-          query.page = page;
+          if (cursor) {
+            query.cursor = cursor;
+          } else {
+            query.page = page;
+          }
+
+          const payload = await this.request<Record<string, unknown>>(
+            `/team/${params.teamId}/time_entries`,
+            query
+          );
+
+          const rawEntries =
+            (Array.isArray(payload.data) ? payload.data : undefined) ??
+            (Array.isArray(payload.time_entries) ? payload.time_entries : undefined) ??
+            [];
+
+          for (const item of rawEntries) {
+            if (!item || typeof item !== 'object') continue;
+
+            const raw = item as Record<string, unknown>;
+            const id = typeof raw.id === 'string' ? raw.id : getStableFallbackEntryId(raw);
+            if (seenIds.has(id)) continue;
+
+            seenIds.add(id);
+
+            entries.push({
+              id,
+              taskId: extractTaskId(raw),
+              durationMs: parseDurationMs(raw.duration),
+              startMs: parseOptionalMs(raw.start),
+              endMs: parseOptionalMs(raw.end),
+              userId:
+                typeof raw.userid === 'string'
+                  ? raw.userid
+                  : typeof raw.userid === 'number'
+                    ? String(raw.userid)
+                    : undefined,
+              raw
+            });
+          }
+
+          const nextCursor = typeof payload.next_cursor === 'string' ? payload.next_cursor : undefined;
+          if (nextCursor) {
+            cursor = nextCursor;
+            continue;
+          }
+
+          const nextPage = typeof payload.next_page === 'number' ? payload.next_page : undefined;
+          if (typeof nextPage === 'number') {
+            if (nextPage <= page) break;
+            page = nextPage;
+            continue;
+          }
+
+          const lastPage = typeof payload.last_page === 'number' ? payload.last_page : undefined;
+          if (typeof lastPage === 'number') {
+            if (page < lastPage) {
+              page += 1;
+              continue;
+            }
+          }
+
+          break;
         }
-
-        const payload = await this.request<Record<string, unknown>>(
-          `/team/${params.teamId}/time_entries`,
-          query
-        );
-
-        const rawEntries =
-          (Array.isArray(payload.data) ? payload.data : undefined) ??
-          (Array.isArray(payload.time_entries) ? payload.time_entries : undefined) ??
-          [];
-
-        for (const item of rawEntries) {
-          if (!item || typeof item !== 'object') continue;
-
-          const raw = item as Record<string, unknown>;
-          const id = typeof raw.id === 'string' ? raw.id : getStableFallbackEntryId(raw);
-          if (seenIds.has(id)) continue;
-
-          seenIds.add(id);
-
-          entries.push({
-            id,
-            taskId: extractTaskId(raw),
-            durationMs: parseDurationMs(raw.duration),
-            startMs: parseOptionalMs(raw.start),
-            endMs: parseOptionalMs(raw.end),
-            userId:
-              typeof raw.userid === 'string'
-                ? raw.userid
-                : typeof raw.userid === 'number'
-                  ? String(raw.userid)
-                  : undefined,
-            raw
-          });
-        }
-
-        const nextCursor = typeof payload.next_cursor === 'string' ? payload.next_cursor : undefined;
-        if (nextCursor) {
-          cursor = nextCursor;
-          continue;
-        }
-
-        const nextPage = typeof payload.next_page === 'number' ? payload.next_page : undefined;
-        if (typeof nextPage === 'number') {
-          if (nextPage <= page) break;
-          page = nextPage;
-          continue;
-        }
-
-        const lastPage = typeof payload.last_page === 'number' ? payload.last_page : undefined;
-        if (typeof lastPage === 'number') {
-          if (page < lastPage) {
-            page += 1;
+      } catch (error) {
+        if (
+          error instanceof ClickUpApiError &&
+          error.status === 400 &&
+          /assignee/i.test(error.message)
+        ) {
+          if (assigneeValue !== undefined) {
             continue;
           }
         }
 
-        break;
+        throw error;
       }
     }
 
