@@ -22,7 +22,8 @@ const getScopeWarning = (alert: AlertConfig, tree: ScopeTreeTeam[]): string | un
 export const refreshSingleAlert = async (
   client: ClickUpClient,
   alert: AlertConfig,
-  scopeTreeOverride?: ScopeTreeTeam[]
+  scopeTreeOverride?: ScopeTreeTeam[],
+  teamMemberIdsOverride?: string[]
 ): Promise<RefreshAlertResult> => {
   if (!alert.active) {
     const snapshot = buildSnapshot(alert, []);
@@ -57,6 +58,7 @@ export const refreshSingleAlert = async (
     }
 
     const timeRange = computeTimeRange(alert);
+    const assigneeIds = teamMemberIdsOverride ?? (await client.getTeamMemberIds(alert.teamId));
     const entries = await client.getTimeEntries({
       teamId: alert.teamId,
       startMs: timeRange.startMs,
@@ -68,7 +70,8 @@ export const refreshSingleAlert = async (
       listId:
         alert.type === 'list' || (alert.type === 'custom' && alert.customScopeType === 'list')
           ? alert.listId
-          : undefined
+          : undefined,
+      assigneeIds
     });
 
     const filteredEntries = applyEntryFilters(alert, entries);

@@ -141,6 +141,25 @@ export class ClickUpClient {
     return (payload.teams ?? []).map((team) => ({ id: String(team.id), name: team.name }));
   }
 
+  async getTeamMemberIds(teamId: string): Promise<string[]> {
+    const payload = await this.request<{
+      teams?: Array<{
+        id: string | number;
+        members?: Array<{ user?: { id?: string | number } | null }>;
+      }>;
+    }>('/team');
+
+    const team = (payload.teams ?? []).find((item) => String(item.id) === String(teamId));
+    if (!team) return [];
+
+    const ids = (team.members ?? [])
+      .map((member) => member.user?.id)
+      .filter((id): id is string | number => id !== undefined && id !== null)
+      .map((id) => String(id));
+
+    return [...new Set(ids)];
+  }
+
   async getFolders(teamId: string): Promise<FolderInfo[]> {
     const payload = await this.request<{ folders?: Array<{ id: string; name: string }> }>(`/team/${teamId}/folder`, {
       archived: 'false'
@@ -236,6 +255,7 @@ export class ClickUpClient {
     endMs?: number;
     folderId?: string;
     listId?: string;
+    assigneeIds?: string[];
   }): Promise<TimeEntry[]> {
     const entries: TimeEntry[] = [];
     const seenIds = new Set<string>();
@@ -252,6 +272,7 @@ export class ClickUpClient {
         end_date: params.endMs,
         folder_id: params.folderId,
         list_id: params.listId,
+        assignee: params.assigneeIds?.length ? params.assigneeIds.join(',') : undefined,
         include_task_tags: 'true'
       };
 
@@ -286,7 +307,12 @@ export class ClickUpClient {
           durationMs: parseDurationMs(raw.duration),
           startMs: parseOptionalMs(raw.start),
           endMs: parseOptionalMs(raw.end),
-          userId: typeof raw.userid === 'string' ? raw.userid : undefined,
+          userId:
+            typeof raw.userid === 'string'
+              ? raw.userid
+              : typeof raw.userid === 'number'
+                ? String(raw.userid)
+                : undefined,
           raw
         });
       }

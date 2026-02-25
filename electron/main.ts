@@ -82,9 +82,20 @@ const sanitizeDraft = (draft: AlertDraft): AlertDraft => {
 const refreshAllInternal = async (alerts: AlertConfig[]): Promise<RefreshAlertResult[]> => {
   return withClient(async (client) => {
     const results: RefreshAlertResult[] = [];
+    const teamMemberCache = new Map<string, string[]>();
 
     for (const alert of sortAlerts(alerts)) {
-      const refreshed = await refreshSingleAlert(client, alert);
+      let teamMemberIds = teamMemberCache.get(alert.teamId);
+      if (!teamMemberIds) {
+        try {
+          teamMemberIds = await client.getTeamMemberIds(alert.teamId);
+        } catch {
+          teamMemberIds = [];
+        }
+        teamMemberCache.set(alert.teamId, teamMemberIds);
+      }
+
+      const refreshed = await refreshSingleAlert(client, alert, undefined, teamMemberIds);
       results.push(refreshed);
     }
 
@@ -319,7 +330,10 @@ const registerIpcHandlers = (): void => {
     const target = alerts.find((item) => item.id === id);
     if (!target) throw new Error('Alert not found.');
 
-    const result = await withClient(async (client) => refreshSingleAlert(client, target));
+    const result = await withClient(async (client) => {
+      const teamMemberIds = await client.getTeamMemberIds(target.teamId).catch(() => []);
+      return refreshSingleAlert(client, target, undefined, teamMemberIds);
+    });
 
     const nextAlerts = alerts.map((item) => (item.id === id ? result.alert : item));
     await store.setAlerts(nextAlerts);
