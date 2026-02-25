@@ -86,15 +86,16 @@ const extractUserIdsFromUserArray = (value: unknown): string[] => {
 
 const ASSIGNEE_QUERY_UNASSIGNED = '__UNASSIGNED__';
 const ASSIGNEE_QUERY_NONE = '__NONE__';
+const ASSIGNEE_QUERY_ALL = '__ALL__';
 
 const buildAssigneeQueryValues = (assigneeIds?: string[]): string[] => {
   const normalized = [...new Set((assigneeIds ?? []).map((id) => id.trim()).filter((id) => id.length > 0))];
   if (normalized.length === 0) {
-    return [ASSIGNEE_QUERY_NONE];
+    return [ASSIGNEE_QUERY_NONE, ASSIGNEE_QUERY_ALL];
   }
 
   // Query named assignees, unassigned tasks, and one unfiltered pass to avoid API edge omissions.
-  return [...normalized, ASSIGNEE_QUERY_UNASSIGNED, ASSIGNEE_QUERY_NONE];
+  return [...normalized, ASSIGNEE_QUERY_UNASSIGNED, ASSIGNEE_QUERY_ALL, ASSIGNEE_QUERY_NONE];
 };
 
 export class ClickUpClient {
@@ -186,20 +187,48 @@ export class ClickUpClient {
   }
 
   async getTeamMemberIds(teamId: string): Promise<string[]> {
-    const payload = await this.request<{ teams?: Array<Record<string, unknown>> }>('/team');
+    const ids = new Set<string>();
 
-    const team = (payload.teams ?? []).find((item) => String(item.id) === String(teamId));
-    if (!team) return [];
+    try {
+      const payload = await this.request<{ teams?: Array<Record<string, unknown>> }>('/team');
+      const team = (payload.teams ?? []).find((item) => String(item.id) === String(teamId));
+      if (team) {
+        const teamIds = [
+          ...extractUserIdsFromUserArray(team.members),
+          ...extractUserIdsFromUserArray(team.guests),
+          ...extractUserIdsFromUserArray(team.users),
+          ...extractUserIdsFromUserArray(team.member_guests),
+          ...extractUserIdsFromUserArray(team.member_invites)
+        ];
+        for (const id of teamIds) ids.add(id);
+      }
+    } catch {
+      // Fallback endpoints below.
+    }
 
-    const ids = [
-      ...extractUserIdsFromUserArray(team.members),
-      ...extractUserIdsFromUserArray(team.guests),
-      ...extractUserIdsFromUserArray(team.users),
-      ...extractUserIdsFromUserArray(team.member_guests),
-      ...extractUserIdsFromUserArray(team.member_invites)
-    ];
+    try {
+      const payload = await this.request<Record<string, unknown>>(`/team/${teamId}`);
+      const teamIds = [
+        ...extractUserIdsFromUserArray(payload.members),
+        ...extractUserIdsFromUserArray(payload.guests),
+        ...extractUserIdsFromUserArray(payload.users),
+        ...extractUserIdsFromUserArray(payload.member_guests),
+        ...extractUserIdsFromUserArray(payload.member_invites)
+      ];
+      for (const id of teamIds) ids.add(id);
+    } catch {
+      // Endpoint may not be available for every token type.
+    }
 
-    return [...new Set(ids)];
+    try {
+      const payload = await this.request<Record<string, unknown>>(`/team/${teamId}/user`);
+      const users = extractUserIdsFromUserArray(payload.users);
+      for (const id of users) ids.add(id);
+    } catch {
+      // Endpoint may not be available for every token type.
+    }
+
+    return [...ids];
   }
 
   async getFolders(teamId: string): Promise<FolderInfo[]> {
@@ -311,6 +340,8 @@ export class ClickUpClient {
       const assigneeValue =
         assigneeQueryValue === ASSIGNEE_QUERY_UNASSIGNED
           ? '0'
+          : assigneeQueryValue === ASSIGNEE_QUERY_ALL
+            ? 'all'
           : assigneeQueryValue === ASSIGNEE_QUERY_NONE
             ? undefined
             : assigneeQueryValue;
