@@ -8,7 +8,12 @@ const uniqIds = (ids: string[] | undefined): string[] =>
   [...new Set((ids ?? []).map((id) => id.trim()).filter((id) => id.length > 0))];
 
 export const computeTimeRange = (alert: AlertConfig, now = new Date()): TimeRange => {
-  if (alert.timeRangeMode === 'none') return {};
+  if (alert.timeRangeMode === 'none') {
+    return {
+      startMs: 0,
+      endMs: now.getTime()
+    };
+  }
 
   if (alert.timeRangeMode === 'monthly') {
     return {

@@ -53,6 +53,16 @@ const extractTaskId = (raw: Record<string, unknown>): string | undefined => {
   return undefined;
 };
 
+const getStableFallbackEntryId = (raw: Record<string, unknown>): string => {
+  const taskId = extractTaskId(raw) ?? 'no-task';
+  const start = parseOptionalMs(raw.start) ?? 0;
+  const end = parseOptionalMs(raw.end) ?? 0;
+  const duration = parseDurationMs(raw.duration);
+  const userId =
+    typeof raw.userid === 'string' ? raw.userid : typeof raw.userid === 'number' ? String(raw.userid) : 'no-user';
+  return `${taskId}:${userId}:${start}:${end}:${duration}`;
+};
+
 export class ClickUpClient {
   private readonly token: string;
   private readonly baseUrl: string;
@@ -259,86 +269,89 @@ export class ClickUpClient {
   }): Promise<TimeEntry[]> {
     const entries: TimeEntry[] = [];
     const seenIds = new Set<string>();
+    const assigneeIds = params.assigneeIds?.length ? [...new Set(params.assigneeIds)] : [undefined];
 
-    let page = 0;
-    let cursor: string | undefined;
-    let guard = 0;
+    for (const assigneeId of assigneeIds) {
+      let page = 0;
+      let cursor: string | undefined;
+      let guard = 0;
 
-    while (guard < 200) {
-      guard += 1;
+      while (guard < 200) {
+        guard += 1;
 
-      const query: Record<string, string | number | boolean | undefined> = {
-        start_date: params.startMs,
-        end_date: params.endMs,
-        folder_id: params.folderId,
-        list_id: params.listId,
-        assignee: params.assigneeIds?.length ? params.assigneeIds.join(',') : undefined,
-        include_task_tags: 'true'
-      };
+        const query: Record<string, string | number | boolean | undefined> = {
+          start_date: params.startMs,
+          end_date: params.endMs,
+          folder_id: params.folderId,
+          list_id: params.listId,
+          assignee: assigneeId,
+          include_task_tags: 'true'
+        };
 
-      if (cursor) {
-        query.cursor = cursor;
-      } else {
-        query.page = page;
-      }
+        if (cursor) {
+          query.cursor = cursor;
+        } else {
+          query.page = page;
+        }
 
-      const payload = await this.request<Record<string, unknown>>(
-        `/team/${params.teamId}/time_entries`,
-        query
-      );
+        const payload = await this.request<Record<string, unknown>>(
+          `/team/${params.teamId}/time_entries`,
+          query
+        );
 
-      const rawEntries =
-        (Array.isArray(payload.data) ? payload.data : undefined) ??
-        (Array.isArray(payload.time_entries) ? payload.time_entries : undefined) ??
-        [];
+        const rawEntries =
+          (Array.isArray(payload.data) ? payload.data : undefined) ??
+          (Array.isArray(payload.time_entries) ? payload.time_entries : undefined) ??
+          [];
 
-      for (const item of rawEntries) {
-        if (!item || typeof item !== 'object') continue;
+        for (const item of rawEntries) {
+          if (!item || typeof item !== 'object') continue;
 
-        const raw = item as Record<string, unknown>;
-        const id = typeof raw.id === 'string' ? raw.id : `${raw.start}-${raw.end}-${Math.random()}`;
-        if (seenIds.has(id)) continue;
+          const raw = item as Record<string, unknown>;
+          const id = typeof raw.id === 'string' ? raw.id : getStableFallbackEntryId(raw);
+          if (seenIds.has(id)) continue;
 
-        seenIds.add(id);
+          seenIds.add(id);
 
-        entries.push({
-          id,
-          taskId: extractTaskId(raw),
-          durationMs: parseDurationMs(raw.duration),
-          startMs: parseOptionalMs(raw.start),
-          endMs: parseOptionalMs(raw.end),
-          userId:
-            typeof raw.userid === 'string'
-              ? raw.userid
-              : typeof raw.userid === 'number'
-                ? String(raw.userid)
-                : undefined,
-          raw
-        });
-      }
+          entries.push({
+            id,
+            taskId: extractTaskId(raw),
+            durationMs: parseDurationMs(raw.duration),
+            startMs: parseOptionalMs(raw.start),
+            endMs: parseOptionalMs(raw.end),
+            userId:
+              typeof raw.userid === 'string'
+                ? raw.userid
+                : typeof raw.userid === 'number'
+                  ? String(raw.userid)
+                  : undefined,
+            raw
+          });
+        }
 
-      const nextCursor = typeof payload.next_cursor === 'string' ? payload.next_cursor : undefined;
-      if (nextCursor) {
-        cursor = nextCursor;
-        continue;
-      }
-
-      const nextPage = typeof payload.next_page === 'number' ? payload.next_page : undefined;
-      if (typeof nextPage === 'number') {
-        if (nextPage <= page) break;
-        page = nextPage;
-        continue;
-      }
-
-      const lastPage = typeof payload.last_page === 'number' ? payload.last_page : undefined;
-      if (typeof lastPage === 'number') {
-        if (page < lastPage) {
-          page += 1;
+        const nextCursor = typeof payload.next_cursor === 'string' ? payload.next_cursor : undefined;
+        if (nextCursor) {
+          cursor = nextCursor;
           continue;
         }
-      }
 
-      break;
+        const nextPage = typeof payload.next_page === 'number' ? payload.next_page : undefined;
+        if (typeof nextPage === 'number') {
+          if (nextPage <= page) break;
+          page = nextPage;
+          continue;
+        }
+
+        const lastPage = typeof payload.last_page === 'number' ? payload.last_page : undefined;
+        if (typeof lastPage === 'number') {
+          if (page < lastPage) {
+            page += 1;
+            continue;
+          }
+        }
+
+        break;
+      }
     }
 
     return entries;
