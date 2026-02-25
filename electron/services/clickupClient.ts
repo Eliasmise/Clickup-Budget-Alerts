@@ -1,0 +1,320 @@
+import type { FolderInfo, ListInfo, ScopeTreeTeam, TaskInfo, TeamInfo, TimeEntry } from '../../src/shared/types';
+
+const DEFAULT_BASE_URL = 'https://api.clickup.com/api/v2';
+const REQUEST_TIMEOUT_MS = 15000;
+const MAX_ATTEMPTS = 4;
+
+export class ClickUpApiError extends Error {
+  status?: number;
+  code?: string;
+
+  constructor(message: string, status?: number, code?: string) {
+    super(message);
+    this.name = 'ClickUpApiError';
+    this.status = status;
+    this.code = code;
+  }
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const normalizeErrorMessage = (payload: unknown, fallback: string): string => {
+  if (!payload || typeof payload !== 'object') return fallback;
+  const candidate = payload as Record<string, unknown>;
+  if (typeof candidate.err === 'string') return candidate.err;
+  if (typeof candidate.message === 'string') return candidate.message;
+  return fallback;
+};
+
+const parseDurationMs = (duration: unknown): number => {
+  if (typeof duration === 'number' && Number.isFinite(duration)) return Math.max(0, duration);
+  if (typeof duration === 'string') {
+    const parsed = Number(duration);
+    if (Number.isFinite(parsed)) return Math.max(0, parsed);
+  }
+  return 0;
+};
+
+const parseOptionalMs = (value: unknown): number | undefined => {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string') {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return undefined;
+};
+
+const extractTaskId = (raw: Record<string, unknown>): string | undefined => {
+  if (typeof raw.task_id === 'string') return raw.task_id;
+  const task = raw.task;
+  if (task && typeof task === 'object' && typeof (task as Record<string, unknown>).id === 'string') {
+    return (task as Record<string, string>).id;
+  }
+  return undefined;
+};
+
+export class ClickUpClient {
+  private readonly token: string;
+  private readonly baseUrl: string;
+
+  constructor(token: string, baseUrl = process.env.VITE_CLICKUP_API_BASE_URL ?? DEFAULT_BASE_URL) {
+    this.token = token;
+    this.baseUrl = baseUrl.replace(/\/$/, '');
+  }
+
+  private async request<T>(
+    path: string,
+    query?: Record<string, string | number | boolean | undefined>
+  ): Promise<T> {
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries(query ?? {})) {
+      if (value === undefined || value === null) continue;
+      params.set(key, String(value));
+    }
+
+    const url = `${this.baseUrl}${path}${params.size ? `?${params.toString()}` : ''}`;
+
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+      try {
+        const response = await fetch(url, {
+          method: 'GET',
+          headers: {
+            Authorization: this.token,
+            'Content-Type': 'application/json'
+          },
+          signal: controller.signal
+        });
+
+        clearTimeout(timeout);
+
+        const isJson = response.headers.get('content-type')?.includes('application/json');
+        const payload = isJson ? await response.json() : null;
+
+        if (response.ok) {
+          return payload as T;
+        }
+
+        if (response.status === 401) {
+          throw new ClickUpApiError('Invalid or revoked ClickUp token.', 401, 'UNAUTHORIZED');
+        }
+
+        if (response.status === 403) {
+          throw new ClickUpApiError('Token is valid but lacks required permissions for this scope.', 403, 'FORBIDDEN');
+        }
+
+        if ((response.status === 429 || response.status >= 500) && attempt < MAX_ATTEMPTS) {
+          await sleep(250 * 2 ** (attempt - 1));
+          continue;
+        }
+
+        const errorMessage = normalizeErrorMessage(payload, `ClickUp API request failed (${response.status})`);
+        throw new ClickUpApiError(errorMessage, response.status);
+      } catch (error) {
+        clearTimeout(timeout);
+
+        const isRetriableError =
+          error instanceof ClickUpApiError
+            ? error.status === 429 || (typeof error.status === 'number' && error.status >= 500)
+            : true;
+
+        if (attempt < MAX_ATTEMPTS && isRetriableError) {
+          await sleep(250 * 2 ** (attempt - 1));
+          continue;
+        }
+
+        if (error instanceof ClickUpApiError) {
+          throw error;
+        }
+
+        throw new ClickUpApiError('Network error while contacting ClickUp API.');
+      }
+    }
+
+    throw new ClickUpApiError('Unexpected API error.');
+  }
+
+  async getTeams(): Promise<TeamInfo[]> {
+    const payload = await this.request<{ teams?: Array<{ id: string; name: string }> }>('/team');
+    return (payload.teams ?? []).map((team) => ({ id: String(team.id), name: team.name }));
+  }
+
+  async getFolders(teamId: string): Promise<FolderInfo[]> {
+    const payload = await this.request<{ folders?: Array<{ id: string; name: string }> }>(`/team/${teamId}/folder`, {
+      archived: 'false'
+    });
+
+    return (payload.folders ?? []).map((folder) => ({
+      id: String(folder.id),
+      name: folder.name,
+      teamId
+    }));
+  }
+
+  async getLists(folderId: string, teamId: string): Promise<ListInfo[]> {
+    const payload = await this.request<{ lists?: Array<{ id: string; name: string }> }>(`/folder/${folderId}/list`, {
+      archived: 'false'
+    });
+
+    return (payload.lists ?? []).map((list) => ({
+      id: String(list.id),
+      name: list.name,
+      folderId,
+      teamId
+    }));
+  }
+
+  async getAllListsByTeam(teamId: string): Promise<ListInfo[]> {
+    const folders = await this.getFolders(teamId);
+    const nestedLists = await Promise.all(
+      folders.map(async (folder) => {
+        const lists = await this.getLists(folder.id, teamId);
+        return lists;
+      })
+    );
+
+    return nestedLists.flat();
+  }
+
+  async getTasks(listId: string): Promise<TaskInfo[]> {
+    const tasks: TaskInfo[] = [];
+    let page = 0;
+
+    while (page < 200) {
+      const payload = await this.request<{
+        tasks?: Array<{ id: string; name: string }>;
+        last_page?: boolean;
+      }>(`/list/${listId}/task`, {
+        archived: 'false',
+        include_closed: 'true',
+        page
+      });
+
+      const chunk = (payload.tasks ?? []).map((task) => ({
+        id: String(task.id),
+        name: task.name,
+        listId
+      }));
+      tasks.push(...chunk);
+
+      if (payload.last_page || chunk.length === 0) break;
+      page += 1;
+    }
+
+    return tasks;
+  }
+
+  async getScopeTree(): Promise<ScopeTreeTeam[]> {
+    const teams = await this.getTeams();
+
+    return Promise.all(
+      teams.map(async (team) => {
+        const folders = await this.getFolders(team.id);
+        const foldersWithLists = await Promise.all(
+          folders.map(async (folder) => {
+            const lists = await this.getLists(folder.id, team.id);
+            return {
+              ...folder,
+              lists
+            };
+          })
+        );
+
+        return {
+          ...team,
+          folders: foldersWithLists
+        };
+      })
+    );
+  }
+
+  async getTimeEntries(params: {
+    teamId: string;
+    startMs?: number;
+    endMs?: number;
+    folderId?: string;
+    listId?: string;
+  }): Promise<TimeEntry[]> {
+    const entries: TimeEntry[] = [];
+    const seenIds = new Set<string>();
+
+    let page = 0;
+    let cursor: string | undefined;
+    let guard = 0;
+
+    while (guard < 200) {
+      guard += 1;
+
+      const query: Record<string, string | number | boolean | undefined> = {
+        start_date: params.startMs,
+        end_date: params.endMs,
+        folder_id: params.folderId,
+        list_id: params.listId,
+        include_task_tags: 'true'
+      };
+
+      if (cursor) {
+        query.cursor = cursor;
+      } else {
+        query.page = page;
+      }
+
+      const payload = await this.request<Record<string, unknown>>(
+        `/team/${params.teamId}/time_entries`,
+        query
+      );
+
+      const rawEntries =
+        (Array.isArray(payload.data) ? payload.data : undefined) ??
+        (Array.isArray(payload.time_entries) ? payload.time_entries : undefined) ??
+        [];
+
+      for (const item of rawEntries) {
+        if (!item || typeof item !== 'object') continue;
+
+        const raw = item as Record<string, unknown>;
+        const id = typeof raw.id === 'string' ? raw.id : `${raw.start}-${raw.end}-${Math.random()}`;
+        if (seenIds.has(id)) continue;
+
+        seenIds.add(id);
+
+        entries.push({
+          id,
+          taskId: extractTaskId(raw),
+          durationMs: parseDurationMs(raw.duration),
+          startMs: parseOptionalMs(raw.start),
+          endMs: parseOptionalMs(raw.end),
+          userId: typeof raw.userid === 'string' ? raw.userid : undefined,
+          raw
+        });
+      }
+
+      const nextCursor = typeof payload.next_cursor === 'string' ? payload.next_cursor : undefined;
+      if (nextCursor) {
+        cursor = nextCursor;
+        continue;
+      }
+
+      const nextPage = typeof payload.next_page === 'number' ? payload.next_page : undefined;
+      if (typeof nextPage === 'number') {
+        if (nextPage <= page) break;
+        page = nextPage;
+        continue;
+      }
+
+      const lastPage = typeof payload.last_page === 'number' ? payload.last_page : undefined;
+      if (typeof lastPage === 'number') {
+        if (page < lastPage) {
+          page += 1;
+          continue;
+        }
+      }
+
+      break;
+    }
+
+    return entries;
+  }
+}
