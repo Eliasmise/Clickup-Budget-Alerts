@@ -27,10 +27,10 @@ const normalizeErrorMessage = (payload: unknown, fallback: string): string => {
 };
 
 const parseDurationMs = (duration: unknown): number => {
-  if (typeof duration === 'number' && Number.isFinite(duration)) return Math.max(0, duration);
+  if (typeof duration === 'number' && Number.isFinite(duration)) return Math.abs(duration);
   if (typeof duration === 'string') {
     const parsed = Number(duration);
-    if (Number.isFinite(parsed)) return Math.max(0, parsed);
+    if (Number.isFinite(parsed)) return Math.abs(parsed);
   }
   return 0;
 };
@@ -61,6 +61,27 @@ const getStableFallbackEntryId = (raw: Record<string, unknown>): string => {
   const userId =
     typeof raw.userid === 'string' ? raw.userid : typeof raw.userid === 'number' ? String(raw.userid) : 'no-user';
   return `${taskId}:${userId}:${start}:${end}:${duration}`;
+};
+
+const extractUserIdsFromUserArray = (value: unknown): string[] => {
+  if (!Array.isArray(value)) return [];
+
+  const ids = value
+    .map((entry) => {
+      if (!entry || typeof entry !== 'object') return undefined;
+      const record = entry as Record<string, unknown>;
+
+      if (record.user && typeof record.user === 'object') {
+        const userId = (record.user as Record<string, unknown>).id;
+        if (typeof userId === 'string' || typeof userId === 'number') return String(userId);
+      }
+
+      if (typeof record.id === 'string' || typeof record.id === 'number') return String(record.id);
+      return undefined;
+    })
+    .filter((id): id is string => Boolean(id));
+
+  return [...new Set(ids)];
 };
 
 export class ClickUpClient {
@@ -152,20 +173,18 @@ export class ClickUpClient {
   }
 
   async getTeamMemberIds(teamId: string): Promise<string[]> {
-    const payload = await this.request<{
-      teams?: Array<{
-        id: string | number;
-        members?: Array<{ user?: { id?: string | number } | null }>;
-      }>;
-    }>('/team');
+    const payload = await this.request<{ teams?: Array<Record<string, unknown>> }>('/team');
 
     const team = (payload.teams ?? []).find((item) => String(item.id) === String(teamId));
     if (!team) return [];
 
-    const ids = (team.members ?? [])
-      .map((member) => member.user?.id)
-      .filter((id): id is string | number => id !== undefined && id !== null)
-      .map((id) => String(id));
+    const ids = [
+      ...extractUserIdsFromUserArray(team.members),
+      ...extractUserIdsFromUserArray(team.guests),
+      ...extractUserIdsFromUserArray(team.users),
+      ...extractUserIdsFromUserArray(team.member_guests),
+      ...extractUserIdsFromUserArray(team.member_invites)
+    ];
 
     return [...new Set(ids)];
   }
