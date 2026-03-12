@@ -29,4 +29,5 @@ export interface DesktopApi {
   refreshAllAlerts: () => Promise<RefreshAlertResult[]>;
   updateUiPreferences: (prefs: Partial<UiPreferences>) => Promise<UiPreferences>;
   exportCsv: () => Promise<{ filePath: string }>;
+  copyImageToClipboard: (dataUrl: string) => Promise<void>;
 }

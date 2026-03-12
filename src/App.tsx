@@ -1,12 +1,20 @@
-import { useEffect, useMemo, useState } from 'react';
+import html2canvas from 'html2canvas';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 
 import { AlertCard } from './components/AlertCard';
 import { AlertFormModal } from './components/AlertFormModal';
 import { AuthPanel } from './components/AuthPanel';
 import { SummaryStrip } from './components/SummaryStrip';
 import { useBudgetMonitorStore } from './hooks/useBudgetMonitorStore';
-import type { AlertConfig, AlertDraft } from './shared/types';
+import type { AlertConfig, AlertDraft, RefreshAlertResult } from './shared/types';
 import { computeSummary, getVisibleAlerts, statusFilterOptions } from './utils';
+
+const HOURLY_REFRESH_MS = 60 * 60 * 1000;
+const QUEUE_DELAY_MS = 30 * 1000;
+const MAX_RATE_LIMIT_RETRIES = 3;
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const isRateLimitError = (message?: string): boolean => /rate\\s*limit|429|too many requests/i.test(message ?? '');
 
 const toDraft = (alert: AlertConfig): AlertDraft => ({
   name: alert.name,
@@ -51,7 +59,6 @@ function App() {
     reorderAlerts,
     refreshAlert,
     refreshAll,
-    runAutoRefreshDue,
     updateUiPreferences,
     exportCsv,
     clearMessage
@@ -59,20 +66,13 @@ function App() {
 
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingAlert, setEditingAlert] = useState<AlertConfig>();
+  const [hourlyRefreshInProgress, setHourlyRefreshInProgress] = useState(false);
+  const [nextHourlyRunAt, setNextHourlyRunAt] = useState<number>(Date.now() + 5_000);
+  const [localNotice, setLocalNotice] = useState<string>();
 
   useEffect(() => {
     void init();
   }, [init]);
-
-  useEffect(() => {
-    if (!auth.hasToken) return;
-
-    const timer = setInterval(() => {
-      void runAutoRefreshDue();
-    }, 30_000);
-
-    return () => clearInterval(timer);
-  }, [auth.hasToken, runAutoRefreshDue]);
 
   const orderedAlerts = useMemo(() => [...alerts].sort((a, b) => a.order - b.order), [alerts]);
   const visibleAlerts = useMemo(() => getVisibleAlerts(orderedAlerts, uiPreferences), [orderedAlerts, uiPreferences]);
@@ -108,6 +108,137 @@ function App() {
     await createAlert(draft);
   };
 
+  const handleCopySnapshot = useCallback(async (alertId: string) => {
+    const cardElement = document.querySelector<HTMLElement>(`[data-alert-card-id="${alertId}"]`);
+    if (!cardElement) {
+      setLocalNotice('Unable to find card snapshot target.');
+      return;
+    }
+
+    try {
+      const canvas = await html2canvas(cardElement, {
+        backgroundColor: null,
+        scale: 2,
+        useCORS: true,
+        ignoreElements: (element) => (element as HTMLElement).dataset.snapshotExclude === 'true'
+      });
+      const dataUrl = canvas.toDataURL('image/png');
+      await window.clickupMonitor.copyImageToClipboard(dataUrl);
+      setLocalNotice('Card snapshot copied to clipboard.');
+    } catch {
+      setLocalNotice('Failed to copy card snapshot.');
+    }
+  }, []);
+
+  const runQueuedHourlyRefresh = useCallback(async () => {
+    if (hourlyRefreshInProgress) return;
+
+    const activeAlertIds = orderedAlerts.filter((alert) => alert.active).map((alert) => alert.id);
+    setNextHourlyRunAt(Date.now() + HOURLY_REFRESH_MS);
+
+    if (activeAlertIds.length === 0) return;
+
+    setHourlyRefreshInProgress(true);
+    setLocalNotice('Hourly queued refresh started.');
+
+    const queue = [...activeAlertIds];
+    const retryMap = new Map<string, number>();
+
+    try {
+      while (queue.length > 0) {
+        const alertId = queue.shift();
+        if (!alertId) break;
+
+        let result: RefreshAlertResult | undefined;
+        let refreshErrorMessage: string | undefined;
+
+        try {
+          result = await refreshAlert(alertId);
+          refreshErrorMessage = result.errorMessage;
+        } catch (error) {
+          refreshErrorMessage = error instanceof Error ? error.message : 'Unknown refresh failure.';
+        }
+
+        if (isRateLimitError(refreshErrorMessage)) {
+          const retries = retryMap.get(alertId) ?? 0;
+          if (retries < MAX_RATE_LIMIT_RETRIES) {
+            retryMap.set(alertId, retries + 1);
+            queue.push(alertId);
+          }
+        }
+
+        if (queue.length > 0) {
+          await sleep(QUEUE_DELAY_MS);
+        }
+      }
+
+      setLocalNotice('Hourly queued refresh completed.');
+    } finally {
+      setHourlyRefreshInProgress(false);
+    }
+  }, [hourlyRefreshInProgress, orderedAlerts, refreshAlert]);
+
+  useEffect(() => {
+    if (!auth.hasToken) return;
+
+    const tick = () => {
+      if (hourlyRefreshInProgress) return;
+      if (Date.now() >= nextHourlyRunAt) {
+        void runQueuedHourlyRefresh();
+      }
+    };
+
+    tick();
+    const timer = setInterval(tick, 5_000);
+    return () => clearInterval(timer);
+  }, [auth.hasToken, hourlyRefreshInProgress, nextHourlyRunAt, runQueuedHourlyRefresh]);
+
+  useEffect(() => {
+    if (!localNotice) return;
+    const timer = setTimeout(() => setLocalNotice(undefined), 5_000);
+    return () => clearTimeout(timer);
+  }, [localNotice]);
+
+  const appSignal = useMemo(() => {
+    if (hourlyRefreshInProgress) {
+      return {
+        tone: 'yellow' as const,
+        label: 'Queued update in progress'
+      };
+    }
+
+    const activeAlerts = orderedAlerts.filter((alert) => alert.active);
+    if (activeAlerts.length === 0) {
+      return {
+        tone: 'green' as const,
+        label: 'No active alerts'
+      };
+    }
+
+    const staleThreshold = Date.now() - HOURLY_REFRESH_MS;
+    const hasError = activeAlerts.some((alert) => alert.lastSnapshot?.status === 'error');
+    const hasStaleUpdate = activeAlerts.some((alert) => {
+      if (!alert.lastRefreshedAt) return true;
+      const refreshedAt = new Date(alert.lastRefreshedAt).getTime();
+      return Number.isNaN(refreshedAt) || refreshedAt < staleThreshold;
+    });
+
+    if (hasError || hasStaleUpdate) {
+      return {
+        tone: 'red' as const,
+        label: 'Update error or stale data'
+      };
+    }
+
+    return {
+      tone: 'green' as const,
+      label: 'All alerts updated in the last hour'
+    };
+  }, [hourlyRefreshInProgress, orderedAlerts]);
+
+  const signalDotClass =
+    appSignal.tone === 'green' ? 'bg-moss' : appSignal.tone === 'yellow' ? 'bg-amberearth' : 'bg-terracotta';
+
   if (!initialized || loading) {
     return (
       <main className="flex min-h-screen items-center justify-center bg-sand-50 text-stonewarm-900">
@@ -129,10 +260,14 @@ function App() {
       <section className="mx-auto max-w-7xl space-y-4">
         <header className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-stonewarm-200 bg-white px-5 py-4 shadow-soft">
           <div>
-            <h1 className="text-2xl font-semibold text-stonewarm-900">ClickUp Budget Alert Monitor</h1>
+            <div className="flex items-center gap-2">
+              <span className={`h-3 w-3 rounded-full ${signalDotClass}`} title={appSignal.label} />
+              <h1 className="text-2xl font-semibold text-stonewarm-900">ClickUp Budget Alert Monitor</h1>
+            </div>
             <p className="mt-1 text-sm text-stonewarm-700">
               {auth.teams.length} workspace{auth.teams.length === 1 ? '' : 's'} connected
             </p>
+            <p className="text-xs text-stonewarm-700">{appSignal.label}</p>
           </div>
 
           <div className="flex flex-wrap gap-2">
@@ -180,6 +315,12 @@ function App() {
           >
             {noticeMessage}
           </button>
+        ) : null}
+
+        {localNotice ? (
+          <div className="w-full rounded-xl border border-stonewarm-300 bg-sand-100 px-4 py-2 text-left text-sm text-stonewarm-900">
+            {localNotice}
+          </div>
         ) : null}
 
         <SummaryStrip summary={summary} />
@@ -246,6 +387,7 @@ function App() {
                   }}
                   onDuplicate={() => void duplicateAlert(alert.id)}
                   onToggleActive={() => void updateAlert(alert.id, { ...toDraft(alert), active: !alert.active })}
+                  onCopySnapshot={() => void handleCopySnapshot(alert.id)}
                   onMoveUp={() => void handleMove(alert.id, -1)}
                   onMoveDown={() => void handleMove(alert.id, 1)}
                   canMoveUp={orderedIndex > 0}

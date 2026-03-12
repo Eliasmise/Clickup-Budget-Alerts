@@ -16,7 +16,8 @@ const api: DesktopApi = {
   refreshAlert: (id) => ipcRenderer.invoke('alerts:refresh', id),
   refreshAllAlerts: () => ipcRenderer.invoke('alerts:refresh-all'),
   updateUiPreferences: (prefs) => ipcRenderer.invoke('prefs:update', prefs),
-  exportCsv: () => ipcRenderer.invoke('alerts:export-csv')
+  exportCsv: () => ipcRenderer.invoke('alerts:export-csv'),
+  copyImageToClipboard: (dataUrl) => ipcRenderer.invoke('clipboard:write-image', dataUrl)
 };
 
 contextBridge.exposeInMainWorld('clickupMonitor', api);

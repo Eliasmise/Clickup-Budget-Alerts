@@ -11,6 +11,7 @@ interface AlertCardProps {
   onDelete: () => void;
   onDuplicate: () => void;
   onToggleActive: () => void;
+  onCopySnapshot: () => void;
   onMoveUp: () => void;
   onMoveDown: () => void;
   canMoveUp: boolean;
@@ -25,6 +26,7 @@ export function AlertCard({
   onDelete,
   onDuplicate,
   onToggleActive,
+  onCopySnapshot,
   onMoveUp,
   onMoveDown,
   canMoveUp,
@@ -34,7 +36,10 @@ export function AlertCard({
   const status = snapshot?.status ?? (alert.active ? 'inactive' : 'inactive');
 
   return (
-    <article className={clsx('rounded-2xl border p-4 shadow-soft transition', statusCardClass[status])}>
+    <article
+      data-alert-card-id={alert.id}
+      className={clsx('rounded-2xl border p-4 shadow-soft transition', statusCardClass[status])}
+    >
       <div className="flex items-start justify-between gap-3">
         <div>
           <h3 className="text-lg font-semibold text-stonewarm-900">{alert.name}</h3>
@@ -78,7 +83,7 @@ export function AlertCard({
         <p className="mt-2 text-sm font-medium text-terracotta">Over by {hours(snapshot?.overByHours ?? 0)}</p>
       ) : null}
 
-      <div className="mt-4 flex flex-wrap gap-2 text-xs">
+      <div className="mt-4 flex flex-wrap gap-2 text-xs" data-snapshot-exclude="true">
         <button
           onClick={onRefresh}
           disabled={isRefreshing}
@@ -101,9 +106,15 @@ export function AlertCard({
         <button onClick={onDelete} className="rounded-lg border border-clay-500 px-3 py-1.5 text-clay-600 hover:bg-clay-500/10">
           Delete
         </button>
+        <button
+          onClick={onCopySnapshot}
+          className="rounded-lg border border-olive-500 px-3 py-1.5 text-olive-600 hover:bg-olive-500/10"
+        >
+          Copy Snapshot
+        </button>
       </div>
 
-      <div className="mt-2 flex gap-2 text-xs">
+      <div className="mt-2 flex gap-2 text-xs" data-snapshot-exclude="true">
         <button
           onClick={onMoveUp}
           disabled={!canMoveUp}

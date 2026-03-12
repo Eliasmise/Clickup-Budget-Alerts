@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain } from 'electron';
+import { app, BrowserWindow, clipboard, dialog, ipcMain, nativeImage } from 'electron';
 import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
@@ -389,6 +389,19 @@ const registerIpcHandlers = (): void => {
 
     await fs.writeFile(saveResult.filePath, csv, 'utf8');
     return { filePath: saveResult.filePath };
+  });
+
+  ipcMain.handle('clipboard:write-image', async (_, dataUrl: string) => {
+    if (!dataUrl || typeof dataUrl !== 'string') {
+      throw new Error('Invalid image payload.');
+    }
+
+    const image = nativeImage.createFromDataURL(dataUrl);
+    if (image.isEmpty()) {
+      throw new Error('Unable to create image from snapshot.');
+    }
+
+    clipboard.writeImage(image);
   });
 };
 
